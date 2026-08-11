@@ -1,7 +1,8 @@
 /**
  * server.js
  * Server-authoritative-ish multiplayer relay for Ardadashak.
- * The server owns rooms, the shared seed, and player bookkeeping. Actual
+ * The server owns rooms, the shared seed, room-browser listing, the
+ * global (all-time) leaderboard, and player bookkeeping. Actual
  * physics/collision stays client-side (client-prediction style) — the
  * server just relays state at a fixed rate and settles disputes like
  * "who's the host" / "is this room full".
@@ -22,14 +23,23 @@ const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(cors({ origin: '*' }));
+app.use(express.json());
+
+const rooms = new RoomManager();
+
 app.get('/', (req, res) => {
-    res.json({ status: 'ok', service: 'ardadashak-server', time: Date.now() });
+    res.json({ status: 'ok', service: 'ardadashak-server', time: Date.now(), rooms: rooms.rooms.size });
 });
+
+// Optional plain REST mirrors of the socket endpoints below — handy for
+// quick debugging or for a future non-socket dashboard. The game itself
+// talks to the server exclusively over Socket.IO.
+app.get('/rooms', (req, res) => res.json(rooms.listPublicRooms()));
+app.get('/leaderboard', (req, res) => res.json(rooms.getTopScores(10)));
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-const rooms = new RoomManager();
 const leaderboardTimers = new Map(); // code -> interval handle
 
 function broadcastRoom(room) {
@@ -39,12 +49,17 @@ function broadcastRoom(room) {
 function publicRoom(room) {
     return {
         code: room.code,
+        name: room.name,
         maxPlayers: room.maxPlayers,
         difficulty: room.difficulty,
         privacy: room.privacy,
         started: room.started,
         players: room.players
     };
+}
+
+function broadcastRoomList() {
+    io.emit('rooms_list', rooms.listPublicRooms());
 }
 
 function startLeaderboardBroadcast(room) {
@@ -67,6 +82,7 @@ io.on('connection', (socket) => {
         const room = rooms.createRoom(socket.id, opts.name, opts);
         socket.join(room.code);
         broadcastRoom(room);
+        broadcastRoomList();
     });
 
     socket.on('join_room', ({ code, name } = {}) => {
@@ -74,6 +90,7 @@ io.on('connection', (socket) => {
         if (result.error) return socket.emit('room_error', result.error);
         socket.join(result.room.code);
         broadcastRoom(result.room);
+        broadcastRoomList();
     });
 
     socket.on('quick_join', ({ name } = {}) => {
@@ -81,6 +98,15 @@ io.on('connection', (socket) => {
         if (result.error) return socket.emit('room_error', result.error);
         socket.join(result.room.code);
         broadcastRoom(result.room);
+        broadcastRoomList();
+    });
+
+    // Server Browser: client asks for the current public room list. Uses a
+    // Socket.IO ack callback so it behaves like a simple request/response.
+    socket.on('list_rooms', (opts, cb) => {
+        const fn = typeof opts === 'function' ? opts : cb;
+        const list = rooms.listPublicRooms();
+        if (typeof fn === 'function') fn(list);
     });
 
     socket.on('start_game', () => {
@@ -88,6 +114,7 @@ io.on('connection', (socket) => {
         if (result.error) return socket.emit('room_error', result.error);
         io.to(result.room.code).emit('game_started', { seed: result.room.seed, startTime: result.room.startTime });
         broadcastRoom(result.room);
+        broadcastRoomList();
         startLeaderboardBroadcast(result.room);
     });
 
@@ -100,6 +127,7 @@ io.on('connection', (socket) => {
             io.to(code).emit('player_left', { id: socket.id });
             if (result && result.room) broadcastRoom(result.room);
             else stopLeaderboardBroadcast(code);
+            broadcastRoomList();
         }
     });
 
@@ -137,6 +165,16 @@ io.on('connection', (socket) => {
         socket.to(room.code).emit('chat_emoji', { id: socket.id, emoji });
     });
 
+    // ---- Global (all-time) leaderboard ----
+    socket.on('submit_score', (data = {}) => {
+        const top = rooms.submitScore(data);
+        io.emit('global_leaderboard', top);
+    });
+    socket.on('get_leaderboard', (opts, cb) => {
+        const fn = typeof opts === 'function' ? opts : cb;
+        if (typeof fn === 'function') fn(rooms.getTopScores(10));
+    });
+
     socket.on('ping_check', (sentAt) => {
         socket.emit('pong_check', sentAt);
     });
@@ -149,6 +187,7 @@ io.on('connection', (socket) => {
             io.to(code).emit('player_left', { id: socket.id });
             if (result && result.room) broadcastRoom(result.room);
             else stopLeaderboardBroadcast(code);
+            broadcastRoomList();
         }
     });
 });
